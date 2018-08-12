@@ -1,3 +1,20 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // +build !integration
 
 package tls
@@ -118,7 +135,7 @@ func mapInt(t *testing.T, m common.MapStr, key string) uint32 {
 func TestParseRecordHeader(t *testing.T) {
 	if testing.Verbose() {
 		isDebug = true
-		logp.LogInit(logp.LOG_DEBUG, "", false, true, []string{"tls", "tlsdetailed"})
+		logp.TestingSetup(logp.WithSelectors("tls", "tlsdetailed"))
 	}
 
 	_, err := readRecordHeader(sBuf(t, ""))
@@ -131,21 +148,21 @@ func TestParseRecordHeader(t *testing.T) {
 	assert.NotNil(t, err)
 	_, err = readRecordHeader(sBuf(t, "11223344"))
 	assert.NotNil(t, err)
-	header, err := readRecordHeader(sBuf(t, "1122334455"))
+	header, err := readRecordHeader(sBuf(t, "1103024455"))
 	assert.Nil(t, err)
 	assert.Equal(t, recordType(0x11), header.recordType)
-	assert.Equal(t, "34.51", header.version.String())
+	assert.Equal(t, "TLS 1.1", header.version.String())
 	assert.Equal(t, uint16(0x4455), header.length)
-	assert.Equal(t, "recordHeader type[17] version[34.51] length[17493]", header.String())
-	assert.False(t, header.isValid())
-	header.version.major = 3
+	assert.Equal(t, "recordHeader type[17] version[TLS 1.1] length[17493]", header.String())
 	assert.True(t, header.isValid())
+	header.version.major = 2
+	assert.False(t, header.isValid())
 }
 
 func TestParseHandshakeHeader(t *testing.T) {
 	if testing.Verbose() {
 		isDebug = true
-		logp.LogInit(logp.LOG_DEBUG, "", false, true, []string{"tls", "tlsdetailed"})
+		logp.TestingSetup(logp.WithSelectors("tls", "tlsdetailed"))
 	}
 
 	_, err := readHandshakeHeader(sBuf(t, ""))
@@ -164,7 +181,7 @@ func TestParseHandshakeHeader(t *testing.T) {
 func TestParserParse(t *testing.T) {
 	if testing.Verbose() {
 		isDebug = true
-		logp.LogInit(logp.LOG_DEBUG, "", false, true, []string{"tls", "tlsdetailed"})
+		logp.TestingSetup(logp.WithSelectors("tls", "tlsdetailed"))
 	}
 
 	parser := &parser{}
@@ -192,7 +209,7 @@ func TestParserParse(t *testing.T) {
 func TestParserHello(t *testing.T) {
 	if testing.Verbose() {
 		isDebug = true
-		logp.LogInit(logp.LOG_DEBUG, "", false, true, []string{"tls", "tlsdetailed"})
+		logp.TestingSetup(logp.WithSelectors("tls", "tlsdetailed"))
 	}
 
 	parser := &parser{}

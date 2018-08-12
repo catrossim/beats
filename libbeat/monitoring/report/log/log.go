@@ -1,9 +1,23 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package log
 
 import (
-	"bytes"
-	"fmt"
-	"sort"
 	"sync"
 	"time"
 
@@ -30,16 +44,31 @@ var gauges = map[string]bool{
 	"beat.memstats.memory_total":     true,
 	"beat.memstats.memory_alloc":     true,
 	"beat.memstats.gc_next":          true,
+	"beat.info.uptime.ms":            true,
+	"beat.cpu.user.ticks":            true,
+	"beat.cpu.user.time":             true,
+	"beat.cpu.system.ticks":          true,
+	"beat.cpu.system.time":           true,
+	"beat.cpu.total.value":           true,
+	"beat.cpu.total.ticks":           true,
+	"beat.cpu.total.time":            true,
+	"system.load.1":                  true,
+	"system.load.5":                  true,
+	"system.load.15":                 true,
+	"system.load.norm.1":             true,
+	"system.load.norm.5":             true,
+	"system.load.norm.15":            true,
+}
+
+// TODO: Change this when gauges are refactored, too.
+var strConsts = map[string]bool{
+	"beat.info.ephemeral_id": true,
 }
 
 var (
-	// startTime is the time that the process was started.
-	startTime = time.Now()
+	// StartTime is the time that the process was started.
+	StartTime = time.Now()
 )
-
-type logger interface {
-	Infof(format string, v ...interface{})
-}
 
 type reporter struct {
 	wg       sync.WaitGroup
@@ -48,7 +77,7 @@ type reporter struct {
 	registry *monitoring.Registry
 
 	// output
-	logger logger
+	logger *logp.Logger
 }
 
 // MakeReporter returns a new Reporter that periodically reports metrics via
@@ -64,7 +93,7 @@ func MakeReporter(beat beat.Info, cfg *common.Config) (report.Reporter, error) {
 	r := &reporter{
 		done:     make(chan struct{}),
 		period:   config.Period,
-		logger:   logp.NewLogger("metrics"),
+		logger:   logp.NewLogger("monitoring"),
 		registry: monitoring.Default,
 	}
 
@@ -84,7 +113,9 @@ func (r *reporter) Stop() {
 func (r *reporter) snapshotLoop() {
 	r.logger.Infof("Starting metrics logging every %v", r.period)
 	defer r.logger.Infof("Stopping metrics logging.")
-	defer r.logTotals(makeSnapshot(r.registry))
+	defer func() {
+		r.logTotals(makeDeltaSnapshot(monitoring.MakeFlatSnapshot(), makeSnapshot(r.registry)))
+	}()
 
 	ticker := time.NewTicker(r.period)
 	defer ticker.Stop()
@@ -107,7 +138,7 @@ func (r *reporter) snapshotLoop() {
 
 func (r *reporter) logSnapshot(s monitoring.FlatSnapshot) {
 	if snapshotLen(s) > 0 {
-		r.logger.Infof("Non-zero metrics in the last %v: %v", r.period, toKeyValuePairs(s))
+		r.logger.Infow("Non-zero metrics in the last "+r.period.String(), toKeyValuePairs(s)...)
 		return
 	}
 
@@ -115,8 +146,8 @@ func (r *reporter) logSnapshot(s monitoring.FlatSnapshot) {
 }
 
 func (r *reporter) logTotals(s monitoring.FlatSnapshot) {
-	r.logger.Infof("Total non-zero metrics: %v", toKeyValuePairs(s))
-	r.logger.Infof("Uptime: %v", time.Since(startTime))
+	r.logger.Infow("Total non-zero metrics", toKeyValuePairs(s)...)
+	r.logger.Infof("Uptime: %v", time.Since(StartTime))
 }
 
 func makeSnapshot(R *monitoring.Registry) monitoring.FlatSnapshot {
@@ -134,7 +165,9 @@ func makeDeltaSnapshot(prev, cur monitoring.FlatSnapshot) monitoring.FlatSnapsho
 	}
 
 	for k, s := range cur.Strings {
-		if p, ok := prev.Strings[k]; !ok || p != s {
+		if _, found := strConsts[k]; found {
+			delta.Strings[k] = s
+		} else if p, ok := prev.Strings[k]; !ok || p != s {
 			delta.Strings[k] = s
 		}
 	}
@@ -150,7 +183,9 @@ func makeDeltaSnapshot(prev, cur monitoring.FlatSnapshot) monitoring.FlatSnapsho
 	}
 
 	for k, f := range cur.Floats {
-		if p := prev.Floats[k]; p != f {
+		if _, found := gauges[k]; found {
+			delta.Floats[k] = f
+		} else if p := prev.Floats[k]; p != f {
 			delta.Floats[k] = f - p
 		}
 	}
@@ -162,35 +197,20 @@ func snapshotLen(s monitoring.FlatSnapshot) int {
 	return len(s.Bools) + len(s.Floats) + len(s.Ints) + len(s.Strings)
 }
 
-func toKeyValuePairs(s monitoring.FlatSnapshot) string {
+func toKeyValuePairs(s monitoring.FlatSnapshot) []interface{} {
 	data := make(common.MapStr, snapshotLen(s))
 	for k, v := range s.Bools {
-		data[k] = v
+		data.Put(k, v)
 	}
 	for k, v := range s.Floats {
-		data[k] = v
+		data.Put(k, v)
 	}
 	for k, v := range s.Ints {
-		data[k] = v
+		data.Put(k, v)
 	}
 	for k, v := range s.Strings {
-		data[k] = v
+		data.Put(k, v)
 	}
 
-	keys := make([]string, 0, len(data))
-	for k := range data {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var buf bytes.Buffer
-	for _, key := range keys {
-		if buf.Len() != 0 {
-			buf.WriteByte(' ')
-		}
-		buf.WriteString(key)
-		buf.WriteString("=")
-		buf.WriteString(fmt.Sprintf("%v", data[key]))
-	}
-	return buf.String()
+	return []interface{}{logp.Namespace("monitoring"), logp.Reflect("metrics", data)}
 }

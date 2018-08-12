@@ -1,3 +1,20 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // +build darwin
 
 package file_integrity
@@ -26,6 +43,7 @@ type fsreader struct {
 	config      Config
 	eventC      chan Event
 	watchedDirs []os.FileInfo
+	log         *logp.Logger
 }
 
 var flagToAction = map[fsevents.EventFlags]Action{
@@ -95,13 +113,14 @@ func NewEventReader(c Config) (EventProducer, error) {
 		stream.Flags |= fsevents.IgnoreSelf
 	}
 
+	log := logp.NewLogger(moduleName)
 	var dirs []os.FileInfo
 	if !c.Recursive {
 		for _, path := range c.Paths {
 			if info, err := getFileInfo(path); err == nil {
 				dirs = append(dirs, info)
 			} else {
-				logp.Warn("%v failed to get file info for '%s': %v", logPrefix, path, err)
+				log.Warnw("Failed to get file info", "file_path", path, "error", err)
 			}
 		}
 	}
@@ -110,13 +129,16 @@ func NewEventReader(c Config) (EventProducer, error) {
 		config:      c,
 		eventC:      make(chan Event, 1),
 		watchedDirs: dirs,
+		log:         log,
 	}, nil
 }
 
 func (r *fsreader) Start(done <-chan struct{}) (<-chan Event, error) {
 	r.stream.Start()
 	go r.consumeEvents(done)
-	logp.Info("%v started FSEvents watcher recursive:%v", logPrefix, r.config.Recursive)
+	r.log.Infow("Started FSEvents watcher",
+		"file_path", r.config.Paths,
+		"recursive", r.config.Recursive)
 	return r.eventC, nil
 }
 
@@ -127,16 +149,19 @@ func (r *fsreader) consumeEvents(done <-chan struct{}) {
 	for {
 		select {
 		case <-done:
-			debugf("Terminated")
+			r.log.Debug("FSEvents reader terminated")
 			return
 		case events := <-r.stream.Events:
 			for _, event := range events {
-				if !r.isWatched(event.Path) {
-					debugf("Ignoring FSEvents event: path=%v", event.Path)
+				if !r.isWatched(event.Path) || r.config.IsExcludedPath(event.Path) ||
+					!r.config.IsIncludedPath(event.Path) {
 					continue
 				}
-				debugf("Received FSEvents event: id=%d path=%v flags=%s",
-					event.ID, event.Path, flagsToString(event.Flags))
+				r.log.Debugw("Received FSEvents event",
+					"file_path", event.Path,
+					"event_id", event.ID,
+					"event_flags", flagsToString(event.Flags))
+
 				start := time.Now()
 				e := NewEvent(event.Path, flagsToAction(event.Flags), SourceFSNotify,
 					r.config.MaxFileSizeBytes, r.config.HashTypes)
@@ -184,7 +209,7 @@ func (r *fsreader) isWatched(path string) bool {
 	dir := filepath.Dir(path)
 	info, err := getFileInfo(dir)
 	if err != nil {
-		logp.Warn("%v failed to get event file info for '%s': %v", logPrefix, dir, err)
+		r.log.Warnw("failed to get file info", "file_path", dir, "error", err)
 		return false
 	}
 	for _, dir := range r.watchedDirs {

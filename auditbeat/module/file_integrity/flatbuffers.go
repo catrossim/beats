@@ -1,3 +1,20 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package file_integrity
 
 import (
@@ -52,7 +69,7 @@ func fbEncodeEvent(b *flatbuffers.Builder, e *Event) []byte {
 	return b.FinishedBytes()
 }
 
-func fbWriteHash(b *flatbuffers.Builder, hashes map[HashType][]byte) flatbuffers.UOffsetT {
+func fbWriteHash(b *flatbuffers.Builder, hashes map[HashType]Digest) flatbuffers.UOffsetT {
 	if len(hashes) == 0 {
 		return 0
 	}
@@ -65,6 +82,12 @@ func fbWriteHash(b *flatbuffers.Builder, hashes map[HashType][]byte) flatbuffers
 	schema.HashStart(b)
 	for hashType, offset := range offsets {
 		switch hashType {
+		case BLAKE2B_256:
+			schema.HashAddBlake2b256(b, offset)
+		case BLAKE2B_384:
+			schema.HashAddBlake2b384(b, offset)
+		case BLAKE2B_512:
+			schema.HashAddBlake2b512(b, offset)
 		case MD5:
 			schema.HashAddMd5(b, offset)
 		case SHA1:
@@ -89,6 +112,8 @@ func fbWriteHash(b *flatbuffers.Builder, hashes map[HashType][]byte) flatbuffers
 			schema.HashAddSha512224(b, offset)
 		case SHA512_256:
 			schema.HashAddSha512256(b, offset)
+		case XXH64:
+			schema.HashAddXx64(b, offset)
 		}
 	}
 	return schema.HashEnd(b)
@@ -111,7 +136,14 @@ func fbWriteMetadata(b *flatbuffers.Builder, m *Metadata) flatbuffers.UOffsetT {
 	if sidOffset > 0 {
 		schema.MetadataAddSid(b, sidOffset)
 	}
-	schema.MetadataAddMode(b, uint32(m.Mode))
+	mode := m.Mode
+	if m.SetUID {
+		mode |= os.ModeSetuid
+	}
+	if m.SetGID {
+		mode |= os.ModeSetgid
+	}
+	schema.MetadataAddMode(b, uint32(mode))
 	switch m.Type {
 	case UnknownType:
 		schema.MetadataAddType(b, schema.TypeUnknown)
@@ -211,16 +243,18 @@ func fbDecodeMetadata(e *schema.Event) *Metadata {
 	if info == nil {
 		return nil
 	}
-
+	mode := os.FileMode(info.Mode())
 	rtn := &Metadata{
-		Inode: info.Inode(),
-		UID:   info.Uid(),
-		GID:   info.Gid(),
-		SID:   string(info.Sid()),
-		Mode:  os.FileMode(info.Mode()),
-		Size:  info.Size(),
-		MTime: time.Unix(0, info.MtimeNs()).UTC(),
-		CTime: time.Unix(0, info.CtimeNs()).UTC(),
+		Inode:  info.Inode(),
+		UID:    info.Uid(),
+		GID:    info.Gid(),
+		SID:    string(info.Sid()),
+		Mode:   mode & ^(os.ModeSetuid | os.ModeSetgid),
+		Size:   info.Size(),
+		MTime:  time.Unix(0, info.MtimeNs()).UTC(),
+		CTime:  time.Unix(0, info.CtimeNs()).UTC(),
+		SetUID: mode&os.ModeSetuid != 0,
+		SetGID: mode&os.ModeSetgid != 0,
 	}
 
 	switch info.Type() {
@@ -237,18 +271,27 @@ func fbDecodeMetadata(e *schema.Event) *Metadata {
 	return rtn
 }
 
-func fbDecodeHash(e *schema.Event) map[HashType][]byte {
+func fbDecodeHash(e *schema.Event) map[HashType]Digest {
 	hash := e.Hashes(nil)
 	if hash == nil {
 		return nil
 	}
 
-	rtn := map[HashType][]byte{}
+	rtn := map[HashType]Digest{}
 	for _, hashType := range validHashes {
 		var length int
 		var producer func(i int) int8
 
 		switch hashType {
+		case BLAKE2B_256:
+			length = hash.Blake2b256Length()
+			producer = hash.Blake2b256
+		case BLAKE2B_384:
+			length = hash.Blake2b384Length()
+			producer = hash.Blake2b384
+		case BLAKE2B_512:
+			length = hash.Blake2b512Length()
+			producer = hash.Blake2b512
 		case MD5:
 			length = hash.Md5Length()
 			producer = hash.Md5
@@ -285,6 +328,9 @@ func fbDecodeHash(e *schema.Event) map[HashType][]byte {
 		case SHA512_256:
 			length = hash.Sha512256Length()
 			producer = hash.Sha512256
+		case XXH64:
+			length = hash.Xx64Length()
+			producer = hash.Xx64
 		default:
 			panic(errors.Errorf("unhandled hash type: %v", hashType))
 		}

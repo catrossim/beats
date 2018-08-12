@@ -1,3 +1,20 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package file_integrity
 
 import (
@@ -7,7 +24,6 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"hash"
 	"io"
@@ -17,11 +33,13 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/OneOfOne/xxhash"
 	"github.com/pkg/errors"
-
+	"golang.org/x/crypto/blake2b"
 	"golang.org/x/crypto/sha3"
 
 	"github.com/elastic/beats/libbeat/common"
+	"github.com/elastic/beats/libbeat/common/file"
 	"github.com/elastic/beats/metricbeat/mb"
 )
 
@@ -35,8 +53,11 @@ func (s Source) String() string {
 	return "unknown"
 }
 
+// MarshalText marshals the Source to a textual representation of itself.
+func (s Source) MarshalText() ([]byte, error) { return []byte(s.String()), nil }
+
 const (
-	// SourceScan identifies events triggerd by a file system scan.
+	// SourceScan identifies events triggered by a file system scan.
 	SourceScan Source = iota
 	// SourceFSNotify identifies events triggered by a notification from the
 	// file system.
@@ -58,6 +79,9 @@ func (t Type) String() string {
 	return "unknown"
 }
 
+// MarshalText marshals the Type to a textual representation of itself.
+func (t Type) MarshalText() ([]byte, error) { return []byte(t.String()), nil }
+
 // Enum of possible file.Types.
 const (
 	UnknownType Type = iota // Typically seen in deleted notifications where the object is gone.
@@ -72,15 +96,26 @@ var typeNames = map[Type]string{
 	SymlinkType: "symlink",
 }
 
+// Digest is a output of a hash function.
+type Digest []byte
+
+// String returns the digest value in lower-case hexadecimal form.
+func (d Digest) String() string {
+	return hex.EncodeToString(d)
+}
+
+// MarshalText encodes the digest to a hexadecimal representation of itself.
+func (d Digest) MarshalText() ([]byte, error) { return []byte(d.String()), nil }
+
 // Event describe the filesystem change and includes metadata about the file.
 type Event struct {
-	Timestamp  time.Time           // Time of event.
-	Path       string              // The path associated with the event.
-	TargetPath string              // Target path for symlinks.
-	Info       *Metadata           // File metadata (if the file exists).
-	Source     Source              // Source of the event.
-	Action     Action              // Action (like created, updated).
-	Hashes     map[HashType][]byte // File hashes.
+	Timestamp  time.Time           `json:"timestamp"`             // Time of event.
+	Path       string              `json:"path"`                  // The path associated with the event.
+	TargetPath string              `json:"target_path,omitempty"` // Target path for symlinks.
+	Info       *Metadata           `json:"info"`                  // File metadata (if the file exists).
+	Source     Source              `json:"source"`                // Source of the event.
+	Action     Action              `json:"action"`                // Action (like created, updated).
+	Hashes     map[HashType]Digest `json:"hash,omitempty"`        // File hashes.
 
 	// Metadata
 	rtt    time.Duration // Time taken to collect the info.
@@ -89,17 +124,20 @@ type Event struct {
 
 // Metadata contains file metadata.
 type Metadata struct {
-	Inode uint64
-	UID   uint32
-	GID   uint32
-	SID   string
-	Owner string
-	Group string
-	Size  uint64
-	MTime time.Time   // Last modification time.
-	CTime time.Time   // Last metdata change time.
-	Type  Type        // File type (dir, file, symlink).
-	Mode  os.FileMode // Permissions
+	Inode  uint64      `json:"inode"`
+	UID    uint32      `json:"uid"`
+	GID    uint32      `json:"gid"`
+	SID    string      `json:"sid"`
+	Owner  string      `json:"owner"`
+	Group  string      `json:"group"`
+	Size   uint64      `json:"size"`
+	MTime  time.Time   `json:"mtime"`  // Last modification time.
+	CTime  time.Time   `json:"ctime"`  // Last metadata change time.
+	Type   Type        `json:"type"`   // File type (dir, file, symlink).
+	Mode   os.FileMode `json:"mode"`   // Permissions
+	SetUID bool        `json:"setuid"` // setuid bit (POSIX only)
+	SetGID bool        `json:"setgid"` // setgid bit (POSIX only)
+	Origin []string    `json:"origin"` // External origin info for the file (MacOS only)
 }
 
 // NewEventFromFileInfo creates a new Event based on data from a os.FileInfo
@@ -176,66 +214,76 @@ func NewEvent(
 	return NewEventFromFileInfo(path, info, err, action, source, maxFileSize, hashTypes)
 }
 
-func (e *Event) String() string {
-	data, _ := json.Marshal(e)
-	return string(data)
-}
-
 func buildMetricbeatEvent(e *Event, existedBefore bool) mb.Event {
-	m := common.MapStr{
-		"path":   e.Path,
-		"hashed": len(e.Hashes) > 0,
+	file := common.MapStr{
+		"path": e.Path,
 	}
-
-	if e.Action > 0 {
-		m["action"] = e.Action.InOrder(existedBefore, e.Info != nil).StringArray()
+	out := mb.Event{
+		Timestamp: e.Timestamp,
+		Took:      e.rtt,
+		MetricSetFields: common.MapStr{
+			"file": file,
+		},
 	}
 
 	if e.TargetPath != "" {
-		m["target_path"] = e.TargetPath
+		file["target_path"] = e.TargetPath
 	}
 
 	if e.Info != nil {
 		info := e.Info
-		m["inode"] = strconv.FormatUint(info.Inode, 10)
-		m["mtime"] = info.MTime
-		m["ctime"] = info.CTime
+		file["inode"] = strconv.FormatUint(info.Inode, 10)
+		file["mtime"] = info.MTime
+		file["ctime"] = info.CTime
 
 		if e.Info.Type == FileType {
-			m["size"] = info.Size
+			file["size"] = info.Size
 		}
 
 		if info.Type != UnknownType {
-			m["type"] = info.Type.String()
+			file["type"] = info.Type.String()
 		}
 
 		if runtime.GOOS == "windows" {
 			if info.SID != "" {
-				m["sid"] = info.SID
+				file["uid"] = info.SID
 			}
 		} else {
-			m["uid"] = info.UID
-			m["gid"] = info.GID
-			m["mode"] = fmt.Sprintf("%#04o", uint32(info.Mode))
+			file["uid"] = info.UID
+			file["gid"] = info.GID
+			file["mode"] = fmt.Sprintf("%#04o", uint32(info.Mode))
 		}
 
 		if info.Owner != "" {
-			m["owner"] = info.Owner
+			file["owner"] = info.Owner
 		}
 		if info.Group != "" {
-			m["group"] = info.Group
+			file["group"] = info.Group
+		}
+		if info.SetUID {
+			file["setuid"] = true
+		}
+		if info.SetGID {
+			file["setgid"] = true
+		}
+		if len(info.Origin) > 0 {
+			file["origin"] = info.Origin
 		}
 	}
 
-	for hashType, hash := range e.Hashes {
-		m[string(hashType)] = hex.EncodeToString(hash)
+	if len(e.Hashes) > 0 {
+		hashes := make(common.MapStr, len(e.Hashes))
+		for hashType, digest := range e.Hashes {
+			hashes[string(hashType)] = digest
+		}
+		out.MetricSetFields.Put("hash", hashes)
 	}
 
-	out := mb.Event{
-		Timestamp:       e.Timestamp,
-		Took:            e.rtt,
-		MetricSetFields: m,
+	if e.Action > 0 {
+		actions := e.Action.InOrder(existedBefore, e.Info != nil).StringArray()
+		out.MetricSetFields.Put("event.action", actions)
 	}
+
 	return out
 }
 
@@ -288,7 +336,7 @@ func diffEvents(old, new *Event) (Action, bool) {
 	if o, n := old.Info, new.Info; o != nil && n != nil {
 		// The owner and group names are ignored (they aren't persisted).
 		if o.Inode != n.Inode || o.UID != n.UID || o.GID != n.GID || o.SID != n.SID ||
-			o.Mode != n.Mode || o.Type != n.Type {
+			o.Mode != n.Mode || o.Type != n.Type || o.SetUID != n.SetUID || o.SetGID != n.SetGID {
 			result |= AttributesModified
 		}
 
@@ -306,7 +354,7 @@ func diffEvents(old, new *Event) (Action, bool) {
 	return result, result != None
 }
 
-func hashFile(name string, hashType ...HashType) (map[HashType][]byte, error) {
+func hashFile(name string, hashType ...HashType) (map[HashType]Digest, error) {
 	if len(hashType) == 0 {
 		return nil, nil
 	}
@@ -314,6 +362,15 @@ func hashFile(name string, hashType ...HashType) (map[HashType][]byte, error) {
 	var hashes []hash.Hash
 	for _, name := range hashType {
 		switch name {
+		case BLAKE2B_256:
+			h, _ := blake2b.New256(nil)
+			hashes = append(hashes, h)
+		case BLAKE2B_384:
+			h, _ := blake2b.New384(nil)
+			hashes = append(hashes, h)
+		case BLAKE2B_512:
+			h, _ := blake2b.New512(nil)
+			hashes = append(hashes, h)
 		case MD5:
 			hashes = append(hashes, md5.New())
 		case SHA1:
@@ -338,12 +395,14 @@ func hashFile(name string, hashType ...HashType) (map[HashType][]byte, error) {
 			hashes = append(hashes, sha512.New512_224())
 		case SHA512_256:
 			hashes = append(hashes, sha512.New512_256())
+		case XXH64:
+			hashes = append(hashes, xxhash.New64())
 		default:
 			return nil, errors.Errorf("unknown hash type '%v'", name)
 		}
 	}
 
-	f, err := os.Open(name)
+	f, err := file.ReadOpen(name)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to open file for hashing")
 	}
@@ -354,7 +413,7 @@ func hashFile(name string, hashType ...HashType) (map[HashType][]byte, error) {
 		return nil, errors.Wrap(err, "failed to calculate file hashes")
 	}
 
-	nameToHash := make(map[HashType][]byte, len(hashes))
+	nameToHash := make(map[HashType]Digest, len(hashes))
 	for i, h := range hashes {
 		nameToHash[hashType[i]] = h.Sum(nil)
 	}

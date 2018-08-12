@@ -1,3 +1,20 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package file_integrity
 
 import (
@@ -8,6 +25,8 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/joeshaw/multierror"
 	"github.com/pkg/errors"
+
+	"github.com/elastic/beats/libbeat/common/match"
 )
 
 // HashType identifies a cryptographic algorithm.
@@ -19,35 +38,48 @@ func (t *HashType) Unpack(v string) error {
 	return nil
 }
 
-var validHashes = []HashType{MD5, SHA1, SHA224, SHA256, SHA384, SHA3_224, SHA3_256, SHA3_384, SHA3_512, SHA512, SHA512_224, SHA512_256}
+var validHashes = []HashType{
+	BLAKE2B_256, BLAKE2B_384, BLAKE2B_512,
+	MD5,
+	SHA1,
+	SHA224, SHA256, SHA384, SHA512, SHA512_224, SHA512_256,
+	SHA3_224, SHA3_256, SHA3_384, SHA3_512,
+	XXH64,
+}
 
 // Enum of hash types.
 const (
-	MD5        HashType = "md5"
-	SHA1       HashType = "sha1"
-	SHA224     HashType = "sha224"
-	SHA256     HashType = "sha256"
-	SHA384     HashType = "sha384"
-	SHA3_224   HashType = "sha3_224"
-	SHA3_256   HashType = "sha3_256"
-	SHA3_384   HashType = "sha3_384"
-	SHA3_512   HashType = "sha3_512"
-	SHA512     HashType = "sha512"
-	SHA512_224 HashType = "sha512_224"
-	SHA512_256 HashType = "sha512_256"
+	BLAKE2B_256 HashType = "blake2b_256"
+	BLAKE2B_384 HashType = "blake2b_384"
+	BLAKE2B_512 HashType = "blake2b_512"
+	MD5         HashType = "md5"
+	SHA1        HashType = "sha1"
+	SHA224      HashType = "sha224"
+	SHA256      HashType = "sha256"
+	SHA384      HashType = "sha384"
+	SHA3_224    HashType = "sha3_224"
+	SHA3_256    HashType = "sha3_256"
+	SHA3_384    HashType = "sha3_384"
+	SHA3_512    HashType = "sha3_512"
+	SHA512      HashType = "sha512"
+	SHA512_224  HashType = "sha512_224"
+	SHA512_256  HashType = "sha512_256"
+	XXH64       HashType = "xxh64"
 )
 
 // Config contains the configuration parameters for the file integrity
 // metricset.
 type Config struct {
-	Paths               []string   `config:"paths" validate:"required"`
-	HashTypes           []HashType `config:"hash_types"`
-	MaxFileSize         string     `config:"max_file_size"`
-	MaxFileSizeBytes    uint64     `config:",ignore"`
-	ScanAtStart         bool       `config:"scan_at_start"`
-	ScanRatePerSec      string     `config:"scan_rate_per_sec"`
-	ScanRateBytesPerSec uint64     `config:",ignore"`
-	Recursive           bool       `config:"recursive"` // Recursive enables recursive monitoring of directories.
+	Paths               []string        `config:"paths" validate:"required"`
+	HashTypes           []HashType      `config:"hash_types"`
+	MaxFileSize         string          `config:"max_file_size"`
+	MaxFileSizeBytes    uint64          `config:",ignore"`
+	ScanAtStart         bool            `config:"scan_at_start"`
+	ScanRatePerSec      string          `config:"scan_rate_per_sec"`
+	ScanRateBytesPerSec uint64          `config:",ignore"`
+	Recursive           bool            `config:"recursive"` // Recursive enables recursive monitoring of directories.
+	ExcludeFiles        []match.Matcher `config:"exclude_files"`
+	IncludeFiles        []match.Matcher `config:"include_files"`
 }
 
 // Validate validates the config data and return an error explaining all the
@@ -88,7 +120,6 @@ nextHash:
 	if err != nil {
 		errs = append(errs, errors.Wrap(err, "invalid scan_rate_per_sec value"))
 	}
-
 	return errs.Err()
 }
 
@@ -105,6 +136,30 @@ func deduplicate(in []string) []string {
 		lastValue = value
 	}
 	return out
+}
+
+// IsExcludedPath checks if a path matches the exclude_files regular expressions.
+func (c *Config) IsExcludedPath(path string) bool {
+	for _, matcher := range c.ExcludeFiles {
+		if matcher.MatchString(path) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsIncludedPath checks if a path matches the include_files regular expressions.
+func (c *Config) IsIncludedPath(path string) bool {
+	if len(c.IncludeFiles) == 0 {
+		return true
+	}
+
+	for _, matcher := range c.IncludeFiles {
+		if matcher.MatchString(path) {
+			return true
+		}
+	}
+	return false
 }
 
 var defaultConfig = Config{

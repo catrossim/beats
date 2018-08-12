@@ -1,17 +1,30 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package file_integrity
 
 import (
 	"errors"
-	"fmt"
-	"math"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/dustin/go-humanize"
-	"github.com/juju/ratelimit"
+	"golang.org/x/time/rate"
 
 	"github.com/elastic/beats/libbeat/logp"
 )
@@ -24,25 +37,22 @@ var scannerID uint32
 type scanner struct {
 	fileCount   uint64
 	byteCount   uint64
-	tokenBucket *ratelimit.Bucket
+	tokenBucket *rate.Limiter
 
 	done   <-chan struct{}
 	eventC chan Event
 
-	logID     string // Unique ID to correlate log messages to a single instance.
-	logPrefix string
-	config    Config
+	log    *logp.Logger
+	config Config
 }
 
 // NewFileSystemScanner creates a new EventProducer instance that scans the
 // configured file paths.
 func NewFileSystemScanner(c Config) (EventProducer, error) {
-	logID := fmt.Sprintf("[scanner-%v]", atomic.AddUint32(&scannerID, 1))
 	return &scanner{
-		logID:     logID,
-		logPrefix: fmt.Sprintf("%v %v", logPrefix, logID),
-		config:    c,
-		eventC:    make(chan Event, 1),
+		log:    logp.NewLogger(moduleName).With("scanner_id", atomic.AddUint32(&scannerID, 1)),
+		config: c,
+		eventC: make(chan Event, 1),
 	}, nil
 }
 
@@ -54,14 +64,17 @@ func (s *scanner) Start(done <-chan struct{}) (<-chan Event, error) {
 	s.done = done
 
 	if s.config.ScanRateBytesPerSec > 0 {
-		debugf("%v creating token bucket with rate %v/sec and capacity %v",
-			s.logID, s.config.ScanRatePerSec,
-			humanize.Bytes(s.config.MaxFileSizeBytes))
+		s.log.With(
+			"bytes_per_sec", s.config.ScanRateBytesPerSec,
+			"capacity_bytes", s.config.MaxFileSizeBytes).
+			Debugf("Creating token bucket with rate %v/sec and capacity %v",
+				s.config.ScanRatePerSec,
+				s.config.MaxFileSize)
 
-		s.tokenBucket = ratelimit.NewBucketWithRate(
-			float64(s.config.ScanRateBytesPerSec)/2., // Fill Rate
-			int64(s.config.MaxFileSizeBytes))         // Max Capacity
-		s.tokenBucket.TakeAvailable(math.MaxInt64)
+		s.tokenBucket = rate.NewLimiter(
+			rate.Limit(s.config.ScanRateBytesPerSec), // Fill Rate
+			int(s.config.MaxFileSizeBytes))           // Max Capacity
+		s.tokenBucket.ReserveN(time.Now(), int(s.config.MaxFileSizeBytes))
 	}
 
 	go s.scan()
@@ -70,11 +83,8 @@ func (s *scanner) Start(done <-chan struct{}) (<-chan Event, error) {
 
 // scan iterates over the configured paths and generates events for each file.
 func (s *scanner) scan() {
-	if logp.IsDebug(metricsetName) {
-		debugf("%v File system scanner is starting for paths [%v].",
-			s.logID, strings.Join(s.config.Paths, ", "))
-		defer debugf("%v File system scanner is stopping.", s.logID)
-	}
+	s.log.Debugw("File system scanner is starting", "file_path", s.config.Paths)
+	defer s.log.Debug("File system scanner is stopping")
 	defer close(s.eventC)
 	startTime := time.Now()
 
@@ -82,28 +92,45 @@ func (s *scanner) scan() {
 		// Resolve symlinks to ensure we have an absolute path.
 		evalPath, err := filepath.EvalSymlinks(path)
 		if err != nil {
-			logp.Warn("%v failed to scan %v: %v", s.logPrefix, path, err)
+			s.log.Warnw("Failed to scan", "file_path", path, "error", err)
 			continue
 		}
 
 		if err = s.walkDir(evalPath); err != nil {
-			logp.Warn("%v failed to scan %v: %v", s.logPrefix, evalPath, err)
+			s.log.Warnw("Failed to scan", "file_path", evalPath, "error", err)
 		}
 	}
 
 	duration := time.Since(startTime)
 	byteCount := atomic.LoadUint64(&s.byteCount)
 	fileCount := atomic.LoadUint64(&s.fileCount)
-	logp.Info("%v File system scan completed after %v (%v files, %v bytes, %v/sec, %f files/sec).",
-		s.logPrefix, duration, s.fileCount, byteCount,
-		humanize.Bytes(uint64(float64(byteCount)/float64(duration)*float64(time.Second))),
-		float64(fileCount)/float64(duration)*float64(time.Second))
+	s.log.Infow("File system scan completed",
+		"took", duration,
+		"file_count", fileCount,
+		"total_bytes", byteCount,
+		"bytes_per_sec", float64(byteCount)/float64(duration)*float64(time.Second),
+		"files_per_sec", float64(fileCount)/float64(duration)*float64(time.Second),
+	)
 }
 
 func (s *scanner) walkDir(dir string) error {
 	errDone := errors.New("done")
 	startTime := time.Now()
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			if !os.IsNotExist(err) {
+				s.log.Warnw("Scanner is skipping a path because of an error",
+					"file_path", path, "error", err)
+			}
+			return nil
+		}
+
+		if s.config.IsExcludedPath(path) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		defer func() { startTime = time.Now() }()
 
 		event := s.newScanEvent(path, info, err)
@@ -144,13 +171,24 @@ func (s *scanner) throttle(fileSize uint64) {
 		return
 	}
 
-	wait := s.tokenBucket.Take(int64(fileSize))
-	if wait > 0 {
-		timer := time.NewTimer(wait)
-		select {
-		case <-timer.C:
-		case <-s.done:
-		}
+	reservation := s.tokenBucket.ReserveN(time.Now(), int(fileSize))
+	if !reservation.OK() {
+		// This would happen if the file size was greater than the token
+		// buckets burst rate, but that can't happen because we don't hash files
+		// larger than the burst rate (scan_max_file_size).
+		return
+	}
+
+	delay := reservation.Delay()
+	if delay == 0 {
+		return
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-s.done:
+	case <-timer.C:
 	}
 }
 

@@ -1,6 +1,24 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package file_integrity
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"os/user"
@@ -75,4 +93,60 @@ func TestNewMetadata(t *testing.T) {
 	assert.NotZero(t, meta.MTime, "mtime")
 	assert.NotZero(t, meta.CTime, "ctime")
 	assert.Equal(t, FileType, meta.Type, "type")
+}
+
+func TestSetUIDSetGIDBits(t *testing.T) {
+	f, err := ioutil.TempFile("", "setuid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+
+	_, err = f.WriteString("metadata test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Sync()
+	f.Close()
+
+	info, err := os.Lstat(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := NewMetadata(f.Name(), info)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.False(t, meta.SetUID)
+	assert.False(t, meta.SetGID)
+
+	if runtime.GOOS == "windows" {
+		t.Skip("No setuid/setgid bits on Windows")
+	}
+
+	for _, flags := range []os.FileMode{
+		0600 | os.ModeSetuid,
+		0600 | os.ModeSetgid,
+		0600 | os.ModeSetuid | os.ModeSetuid,
+	} {
+		msg := fmt.Sprintf("checking flags %04o", flags)
+		if err = os.Chmod(f.Name(), flags); err != nil {
+			t.Fatal(err, msg)
+		}
+
+		info, err = os.Lstat(f.Name())
+		if err != nil {
+			t.Fatal(err, msg)
+		}
+
+		meta, err = NewMetadata(f.Name(), info)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Equal(t, flags&os.ModeSetuid != 0, meta.SetUID)
+		assert.Equal(t, flags&os.ModeSetgid != 0, meta.SetGID)
+	}
 }

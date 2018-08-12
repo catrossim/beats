@@ -1,3 +1,20 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package host
 
 import (
@@ -22,9 +39,9 @@ import (
 )
 
 func init() {
-	if err := mb.Registry.AddMetricSet("vsphere", "host", New); err != nil {
-		panic(err)
-	}
+	mb.Registry.MustAddMetricSet("vsphere", "host", New,
+		mb.DefaultMetricSet(),
+	)
 }
 
 type MetricSet struct {
@@ -65,7 +82,7 @@ func (m *MetricSet) Fetch() ([]common.MapStr, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	events := []common.MapStr{}
+	var events []common.MapStr
 
 	client, err := govmomi.NewClient(ctx, m.HostURL, m.Insecure)
 	if err != nil {
@@ -142,7 +159,7 @@ func (m *MetricSet) Fetch() ([]common.MapStr, error) {
 }
 
 func getNetworkNames(ctx context.Context, c *vim25.Client, ref types.ManagedObjectReference) ([]string, error) {
-	outputNetworkNames := []string{}
+	var outputNetworkNames []string
 
 	pc := property.DefaultCollector(c)
 
@@ -153,18 +170,22 @@ func getNetworkNames(ctx context.Context, c *vim25.Client, ref types.ManagedObje
 	}
 
 	if len(hs.Network) == 0 {
-		return nil, errors.Wrap(err, "no networks found")
+		return nil, errors.New("no networks found")
 	}
 
-	networksRefs := []types.ManagedObjectReference{}
+	var networkRefs []types.ManagedObjectReference
 	for _, obj := range hs.Network {
 		if obj.Type == "Network" {
-			networksRefs = append(networksRefs, obj)
+			networkRefs = append(networkRefs, obj)
 		}
 	}
 
+	if len(networkRefs) == 0 {
+		return nil, errors.New("no networks found")
+	}
+
 	var nets []mo.Network
-	err = pc.Retrieve(ctx, networksRefs, []string{"name"}, &nets)
+	err = pc.Retrieve(ctx, networkRefs, []string{"name"}, &nets)
 	if err != nil {
 		return nil, fmt.Errorf("error retrieving network from host: %v", err)
 	}

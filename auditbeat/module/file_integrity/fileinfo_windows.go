@@ -1,3 +1,20 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // +build windows
 
 package file_integrity
@@ -12,7 +29,7 @@ import (
 	"github.com/joeshaw/multierror"
 	"github.com/pkg/errors"
 
-	"github.com/elastic/beats/filebeat/input/file"
+	"github.com/elastic/beats/libbeat/common/file"
 )
 
 // NewMetadata returns a new Metadata object. If an error is returned it is
@@ -50,12 +67,13 @@ func NewMetadata(path string, info os.FileInfo) (*Metadata, error) {
 	if !info.IsDir() {
 		fileInfo.SID, fileInfo.Owner, err = fileOwner(path)
 	}
+	fileInfo.Origin, err = GetFileOrigin(path)
 	return fileInfo, err
 }
 
 // fileOwner returns the SID and name (domain\user) of the file's owner.
 func fileOwner(path string) (sid, owner string, err error) {
-	f, err := os.Open(path)
+	f, err := file.ReadOpen(path)
 	if err != nil {
 		return "", "", errors.Wrap(err, "failed to open file to get owner")
 	}
